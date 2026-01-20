@@ -3,6 +3,7 @@ import re
 import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from difflib import SequenceMatcher
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -18,8 +19,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", 0))
 
+# Timezone for display (Central Time)
+DISPLAY_TZ = ZoneInfo("America/Chicago")
+
 # Acknowledgment pattern
-# Matches: "I, [Name], acknowledge and agree to the HHG Employee Handbook v2026-01-20"
 ACK_PATTERN = re.compile(
     r"I,?\s+(.+?),?\s+acknowledge\s+and\s+agree\s+to\s+the\s+HHG\s+Employee\s+Handbook\s+(v[\d\-]+)",
     re.IGNORECASE
@@ -52,10 +55,8 @@ def find_similar_names(conn, full_name: str, threshold: float = 0.6):
         emp_lower = emp_name.lower()
         emp_parts = emp_lower.split()
         
-        # Check full name similarity
         ratio = SequenceMatcher(None, input_lower, emp_lower).ratio()
         
-        # Boost score if first or last name matches closely
         part_bonus = 0
         for input_part in input_parts:
             for emp_part in emp_parts:
@@ -73,7 +74,6 @@ def find_similar_names(conn, full_name: str, threshold: float = 0.6):
                 "score": final_score
             })
     
-    # Sort by score descending, return top 3
     matches.sort(key=lambda x: x["score"], reverse=True)
     return matches[:3]
 
@@ -88,6 +88,7 @@ def update_employee_telegram(conn, employee_id: int, telegram_user_id: str, tele
             WHERE id = %s
         """, (telegram_user_id, telegram_username, employee_id))
         conn.commit()
+        logger.info(f"Updated employee {employee_id}: telegram_user_id={telegram_user_id}, telegram_username={telegram_username}")
 
 def insert_acknowledgment(conn, employee_id: int, version: str, ack_text: str, message: dict):
     """Insert acknowledgment record."""
@@ -133,11 +134,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not message.text:
         return
     
-    # Restrict to specific group
     if ALLOWED_CHAT_ID and message.chat_id != ALLOWED_CHAT_ID:
         return
     
-    # Check for acknowledgment pattern
     match = ACK_PATTERN.search(message.text)
     if not match:
         return
@@ -149,7 +148,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_user_id = str(user.id)
     telegram_username = user.username or ""
     
-    # Prepare message data for storage
+    logger.info(f"Processing acknowledgment from {full_name}, Telegram ID: {telegram_user_id}, Username: {telegram_username}")
+    
     message_data = {
         "chat_id": message.chat_id,
         "message_id": message.message_id,
@@ -176,11 +176,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = get_db_connection()
         
-        # Find employee by full_name
         employee = find_employee_by_name(conn, full_name)
         
         if not employee:
-            # Look for similar names
             similar = find_similar_names(conn, full_name)
             
             if similar:
@@ -203,7 +201,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         employee_id = employee["id"]
         db_full_name = employee["full_name"]
         
-        # Check if already acknowledged
         if check_existing_acknowledgment(conn, employee_id, version):
             await message.reply_text(
                 f"✓ {db_full_name}, you've already acknowledged handbook {version}."
@@ -219,11 +216,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         conn.close()
         
+        # Get current time in Central Time for display
+        now_ct = datetime.now(DISPLAY_TZ)
+        timestamp_display = now_ct.strftime('%Y-%m-%d %I:%M:%S %p CT')
+        
         logger.info(f"Recorded: {db_full_name} (@{telegram_username}) acknowledged {version}")
         
         await message.reply_text(
             f"✓ Recorded: {db_full_name} acknowledged HHG Employee Handbook {version}\n"
-            f"Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            f"Timestamp: {timestamp_display}"
         )
         
     except Exception as e:
