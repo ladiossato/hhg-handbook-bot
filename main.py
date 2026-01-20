@@ -3,6 +3,7 @@ import re
 import json
 import logging
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import psycopg
@@ -27,36 +28,66 @@ ACK_PATTERN = re.compile(
 def get_db_connection():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-def find_or_create_employee(conn, telegram_user_id: str, telegram_username: str, full_name: str):
-    """Find employee by telegram_user_id, or create if not exists. Return employee ID (integer)."""
+def find_employee_by_name(conn, full_name: str):
+    """Find employee by exact full_name match (case-insensitive). Return employee record or None."""
     with conn.cursor() as cur:
-        # Check if employee exists
         cur.execute(
-            "SELECT id FROM employees WHERE telegram_user_id = %s",
-            (telegram_user_id,)
+            "SELECT id, full_name, telegram_user_id FROM employees WHERE LOWER(full_name) = LOWER(%s)",
+            (full_name,)
         )
-        row = cur.fetchone()
+        return cur.fetchone()
+
+def find_similar_names(conn, full_name: str, threshold: float = 0.6):
+    """Find employees with similar names. Returns list of potential matches."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, full_name FROM employees WHERE full_name IS NOT NULL")
+        all_employees = cur.fetchall()
+    
+    input_lower = full_name.lower()
+    input_parts = input_lower.split()
+    
+    matches = []
+    for emp in all_employees:
+        emp_name = emp["full_name"]
+        emp_lower = emp_name.lower()
+        emp_parts = emp_lower.split()
         
-        if row:
-            # Update username/name if changed
-            cur.execute("""
-                UPDATE employees 
-                SET telegram_username = %s,
-                    full_name = COALESCE(NULLIF(%s, ''), full_name),
-                    updated_at = NOW()
-                WHERE telegram_user_id = %s
-            """, (telegram_username, full_name, telegram_user_id))
-            conn.commit()
-            return row["id"]
-        else:
-            # Create new employee
-            cur.execute("""
-                INSERT INTO employees (telegram_user_id, telegram_username, full_name, status, created_at, updated_at)
-                VALUES (%s, %s, %s, 'pending', NOW(), NOW())
-                RETURNING id
-            """, (telegram_user_id, telegram_username, full_name))
-            conn.commit()
-            return cur.fetchone()["id"]
+        # Check full name similarity
+        ratio = SequenceMatcher(None, input_lower, emp_lower).ratio()
+        
+        # Boost score if first or last name matches closely
+        part_bonus = 0
+        for input_part in input_parts:
+            for emp_part in emp_parts:
+                part_ratio = SequenceMatcher(None, input_part, emp_part).ratio()
+                if part_ratio > 0.8:
+                    part_bonus = 0.15
+                    break
+        
+        final_score = ratio + part_bonus
+        
+        if final_score >= threshold:
+            matches.append({
+                "id": emp["id"],
+                "full_name": emp_name,
+                "score": final_score
+            })
+    
+    # Sort by score descending, return top 3
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    return matches[:3]
+
+def update_employee_telegram(conn, employee_id: int, telegram_user_id: str, telegram_username: str):
+    """Update employee's Telegram info."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE employees 
+            SET telegram_user_id = %s,
+                telegram_username = %s,
+                updated_at = NOW()
+            WHERE id = %s
+        """, (telegram_user_id, telegram_username, employee_id))
+        conn.commit()
 
 def insert_acknowledgment(conn, employee_id: int, version: str, ack_text: str, message: dict):
     """Insert acknowledgment record."""
@@ -86,15 +117,14 @@ def insert_acknowledgment(conn, employee_id: int, version: str, ack_text: str, m
         conn.commit()
         return cur.fetchone()["id"]
 
-def check_existing_acknowledgment(conn, telegram_user_id: str, version: str) -> bool:
-    """Check if user already acknowledged this version."""
+def check_existing_acknowledgment(conn, employee_id: int, version: str) -> bool:
+    """Check if employee already acknowledged this version."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT 1 FROM acknowledgments a
-            JOIN employees e ON e.id = a.employee_id
-            WHERE e.telegram_user_id = %s AND a.handbook_version = %s
+            SELECT 1 FROM acknowledgments
+            WHERE employee_id = %s AND handbook_version = %s
             LIMIT 1
-        """, (telegram_user_id, version))
+        """, (employee_id, version))
         return cur.fetchone() is not None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,7 +146,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     version = match.group(2).strip()
     
     user = message.from_user
-    telegram_user_id = str(user.id)  # varchar in DB
+    telegram_user_id = str(user.id)
     telegram_username = user.username or ""
     
     # Prepare message data for storage
@@ -146,26 +176,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = get_db_connection()
         
+        # Find employee by full_name
+        employee = find_employee_by_name(conn, full_name)
+        
+        if not employee:
+            # Look for similar names
+            similar = find_similar_names(conn, full_name)
+            
+            if similar:
+                suggestions = "\n".join([f"• {s['full_name']}" for s in similar])
+                await message.reply_text(
+                    f"⚠️ Name not found: \"{full_name}\"\n\n"
+                    f"Did you mean one of these?\n{suggestions}\n\n"
+                    f"Please resend using your exact name as shown above.\n\n"
+                    f"Example:\nI, {similar[0]['full_name']}, acknowledge and agree to the HHG Employee Handbook {version}"
+                )
+            else:
+                await message.reply_text(
+                    f"⚠️ Name not found: \"{full_name}\"\n\n"
+                    f"Please use your full name exactly as it appears in our system.\n\n"
+                    f"Contact your manager if you need help."
+                )
+            conn.close()
+            return
+        
+        employee_id = employee["id"]
+        db_full_name = employee["full_name"]
+        
         # Check if already acknowledged
-        if check_existing_acknowledgment(conn, telegram_user_id, version):
+        if check_existing_acknowledgment(conn, employee_id, version):
             await message.reply_text(
-                f"✓ {full_name}, you've already acknowledged handbook {version}."
+                f"✓ {db_full_name}, you've already acknowledged handbook {version}."
             )
             conn.close()
             return
         
-        # Find or create employee
-        employee_id = find_or_create_employee(conn, telegram_user_id, telegram_username, full_name)
+        # Update employee's Telegram info
+        update_employee_telegram(conn, employee_id, telegram_user_id, telegram_username)
         
         # Insert acknowledgment
         insert_acknowledgment(conn, employee_id, version, message.text, message_data)
         
         conn.close()
         
-        logger.info(f"Recorded: {full_name} (@{telegram_username}) acknowledged {version}")
+        logger.info(f"Recorded: {db_full_name} (@{telegram_username}) acknowledged {version}")
         
         await message.reply_text(
-            f"✓ Recorded: {full_name} acknowledged HHG Employee Handbook {version}\n"
+            f"✓ Recorded: {db_full_name} acknowledged HHG Employee Handbook {version}\n"
             f"Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
         
