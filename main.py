@@ -5,8 +5,8 @@ import logging
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +25,7 @@ ACK_PATTERN = re.compile(
 )
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 def find_or_create_employee(conn, telegram_user_id: str, telegram_username: str, full_name: str):
     """Find employee by telegram_user_id, or create if not exists. Return employee ID (integer)."""
